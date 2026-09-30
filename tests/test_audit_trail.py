@@ -168,3 +168,111 @@ def test_input_fingerprint_is_deterministic():
     e1 = _event(input={"b": 2, "a": 1})
     e2 = _event(input={"a": 1, "b": 2})
     assert e1.input_fingerprint == e2.input_fingerprint
+
+
+def test_checkpoint_of_empty_log_is_none(trail):
+    assert trail.checkpoint() is None
+
+
+def test_checkpoint_describes_tip(trail):
+    for i in range(3):
+        trail.append(_event(input={"i": i}))
+    cp = trail.checkpoint()
+    assert cp["last_seq"] == 2
+    assert cp["records"] == 3
+    assert cp["entry_hash"] == trail.get(2)["entry_hash"]
+    assert cp["genesis_prev_hash"] == "0" * 64
+    assert "checkpointed_at" in cp
+
+
+def test_rotate_below_max_records_rejected(trail):
+    trail.append(_event(input={"a": 1}))
+    with pytest.raises(ValueError):
+        trail.rotate(max_records=10)
+
+
+def test_rotate_empty_log_rejected(trail):
+    with pytest.raises(ValueError):
+        trail.rotate(force=True)
+
+
+def test_rotation_continues_hash_chain(tmp_path):
+    path = str(tmp_path / "trail.jsonl")
+    trail = AuditTrail(path)
+    for i in range(3):
+        trail.append(_event(input={"i": i}))
+    tip_hash = trail.get(2)["entry_hash"]
+
+    cp = trail.rotate(max_records=3)
+    assert cp["last_seq"] == 2
+    assert cp["entry_hash"] == tip_hash
+    assert cp["records"] == 3
+    assert os.path.exists(cp["archived_log"])
+    assert os.path.exists(path + ".checkpoint.json")
+    # the live path starts empty again
+    assert len(AuditTrail(path)) == 0
+
+    # the archived file still verifies on its own
+    archived = AuditTrail(cp["archived_log"])
+    assert archived.verify().ok
+
+    # continue the chain from the checkpoint: seq continues, links hold
+    continued = AuditTrail(path, checkpoint=AuditTrail.load_checkpoint(path))
+    record = continued.append(_event(input={"i": 3}))
+    assert record["seq"] == 3
+    assert record["prev_hash"] == tip_hash
+    assert continued.verify().ok
+
+    # without the checkpoint the continued file looks tampered
+    naive = AuditTrail(path)
+    assert not naive.verify().ok
+
+
+def test_rotation_with_force(tmp_path):
+    path = str(tmp_path / "trail.jsonl")
+    trail = AuditTrail(path)
+    trail.append(_event(input={"a": 1}))
+    cp = trail.rotate(max_records=100, force=True)
+    assert cp["records"] == 1
+    assert len(AuditTrail(path)) == 0
+
+
+def test_cli_stats_checkpoint_and_rotate(tmp_path, capsys):
+    from ai_audit_trail.cli import main
+
+    log = str(tmp_path / "trail.jsonl")
+    assert main(["--log", log, "log", "--model", "m1", "--decision", "deny"]) == 0
+    assert main(["--log", log, "log", "--model", "m1", "--decision", "approve"]) == 0
+
+    assert main(["--log", log, "stats"]) == 0
+    out = capsys.readouterr().out
+    assert "records: 2" in out
+    assert "chain: intact" in out
+    assert "m1: 2" in out
+
+    assert main(["--log", log, "checkpoint"]) == 0
+    cp = json.loads(capsys.readouterr().out)
+    assert cp["records"] == 2
+    assert cp["last_seq"] == 1
+
+    assert main(["--log", log, "rotate", "--force"]) == 0
+    assert main(["--log", log, "stats"]) == 0
+    assert "records: 0" in capsys.readouterr().out
+
+
+def test_tamper_demo_runs(tmp_path):
+    import subprocess
+    import sys
+
+    demo = os.path.join(os.path.dirname(__file__), "..", "examples", "tamper_demo.py")
+    env = dict(os.environ)
+    src = os.path.join(os.path.dirname(__file__), "..", "src")
+    env["PYTHONPATH"] = os.path.abspath(src) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(demo)],
+        capture_output=True, text=True, env=env, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "chain intact = True" in proc.stdout
+    assert "payload modified" in proc.stdout
+    assert "entry_hash mismatch" in proc.stdout
