@@ -99,6 +99,68 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rotate(args: argparse.Namespace) -> int:
+    trail = _trail(args)
+    try:
+        cp = trail.rotate(
+            max_records=args.max_records,
+            archive_dir=args.archive_dir,
+            force=args.force,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"rotated: archived {cp['records']} record(s) to {cp['archived_log']}")
+    print(f"checkpoint written to {trail.checkpoint_path}")
+    print(f"tip: seq={cp['last_seq']} hash={cp['entry_hash'][:16]}...")
+    return 0
+
+
+def cmd_checkpoint(args: argparse.Namespace) -> int:
+    trail = _trail(args)
+    cp = trail.checkpoint()
+    if cp is None:
+        print("log is empty: no checkpoint")
+        return 0
+    print(json.dumps(cp, indent=2))
+    return 0
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    from collections import Counter
+
+    trail = _trail(args)
+    records = list(trail.iter_events())
+    result = trail.verify()
+    by_model: Counter = Counter()
+    by_decision: Counter = Counter()
+    timestamps = []
+    for record in records:
+        event = record.get("event", {})
+        by_model[str(event.get("model_id", "?"))] += 1
+        by_decision[str(event.get("decision", "?"))] += 1
+        ts = event.get("timestamp")
+        if ts:
+            timestamps.append(str(ts))
+    print(f"records: {len(records)}")
+    if timestamps:
+        print(f"time range: {min(timestamps)} .. {max(timestamps)}")
+    print(
+        f"chain: {'intact' if result.ok else 'BROKEN'} "
+        f"({result.records_checked} record(s) checked)"
+    )
+    if not result.ok:
+        for error in result.errors:
+            print(f"  - {error}")
+    print("by model:")
+    for model, count in by_model.most_common():
+        print(f"  {model}: {count}")
+    print("by decision:")
+    for decision, count in by_decision.most_common():
+        print(f"  {decision}: {count}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="audit-trail",
@@ -147,6 +209,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--redact-field", action="append")
     p.add_argument("--redact-auto", action="store_true")
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser(
+        "rotate",
+        help="archive the log and continue the chain in a fresh file",
+    )
+    p.add_argument("--max-records", type=int, default=10000,
+                   help="rotate once the log holds this many records")
+    p.add_argument("--archive-dir", default=None,
+                   help="where to put the archived file (default: log directory)")
+    p.add_argument("--force", action="store_true",
+                   help="rotate even below --max-records")
+    p.set_defaults(func=cmd_rotate)
+
+    p = sub.add_parser("checkpoint", help="print the current chain tip")
+    p.set_defaults(func=cmd_checkpoint)
+
+    p = sub.add_parser("stats", help="log statistics and chain status")
+    p.set_defaults(func=cmd_stats)
 
     return parser
 

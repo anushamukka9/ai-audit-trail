@@ -35,14 +35,24 @@ class AuditTrail:
 
     Safe for concurrent use from threads and multiple processes: appends are
     serialised with an in-process lock plus an OS-level file lock.
+
+    ``checkpoint`` links a fresh log to an archived one: pass the checkpoint
+    dict written by :meth:`rotate` and the first record of the new file
+    chains to the archived log's last ``entry_hash`` (with ``seq``
+    continuing), so verification spans the rotation boundary.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, checkpoint: Dict[str, Any] | None = None) -> None:
         self.path = path
+        self._checkpoint = dict(checkpoint) if checkpoint else None
         self._lock = threading.Lock()
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
+
+    @property
+    def checkpoint_path(self) -> str:
+        return self.path + ".checkpoint.json"
 
     # ------------------------------------------------------------------
     # low-level record IO
@@ -103,9 +113,18 @@ class AuditTrail:
 
         with self._lock:
             records = self._read_records()
-            prev = records[-1] if records else None
-            prev_hash = prev["entry_hash"] if prev else hashing.GENESIS_PREV_HASH
-            seq = prev["seq"] + 1 if prev else 0
+            if records:
+                last = records[-1]
+                prev_hash = last["entry_hash"]
+                seq = last["seq"] + 1
+            elif self._checkpoint:
+                # Fresh file continuing an archived log: chain to the
+                # checkpoint and continue the sequence numbering.
+                prev_hash = self._checkpoint["entry_hash"]
+                seq = self._checkpoint["last_seq"] + 1
+            else:
+                prev_hash = hashing.GENESIS_PREV_HASH
+                seq = 0
             record = {
                 "seq": seq,
                 "prev_hash": prev_hash,
@@ -179,17 +198,30 @@ class AuditTrail:
     # verification
     # ------------------------------------------------------------------
     def verify(self) -> VerificationResult:
-        """Recompute the full hash chain; report any tampering."""
+        """Recompute the full hash chain; report any tampering.
+
+        When this trail was opened with a ``checkpoint``, the first record
+        is expected to chain to the checkpoint's ``entry_hash`` and the
+        sequence is expected to continue from the checkpoint's ``last_seq``.
+        """
         errors: List[str] = []
         records = self._read_records()
-        prev_hash = hashing.GENESIS_PREV_HASH
+        if self._checkpoint:
+            expected_prev_hash = self._checkpoint["entry_hash"]
+            expected_first_seq = self._checkpoint["last_seq"] + 1
+        else:
+            expected_prev_hash = hashing.GENESIS_PREV_HASH
+            expected_first_seq = 0
+        prev_hash = expected_prev_hash
         for index, record in enumerate(records):
+            expected_seq = expected_first_seq + index
             if not hashing.is_well_formed_record(record):
                 errors.append(f"record at index {index}: malformed")
                 continue
-            if record["seq"] != index:
+            if record["seq"] != expected_seq:
                 errors.append(
-                    f"record at index {index}: seq is {record['seq']}, expected {index}"
+                    f"record at index {index}: seq is {record['seq']}, "
+                    f"expected {expected_seq}"
                 )
             if record["prev_hash"] != prev_hash:
                 errors.append(f"record seq {record['seq']}: prev_hash mismatch (link broken)")
@@ -198,6 +230,81 @@ class AuditTrail:
                 errors.append(f"record seq {record['seq']}: entry_hash mismatch (content altered)")
             prev_hash = record.get("entry_hash", prev_hash)
         return VerificationResult(ok=not errors, records_checked=len(records), errors=errors)
+
+    # ------------------------------------------------------------------
+    # checkpoints and rotation
+    # ------------------------------------------------------------------
+    def checkpoint(self) -> Dict[str, Any] | None:
+        """Describe the current tip of the log.
+
+        Returns a dict with ``last_seq``, ``entry_hash``, ``records``,
+        ``genesis_prev_hash`` (what this file chains from) and
+        ``checkpointed_at``; None for an empty log. The dict is what
+        :meth:`rotate` persists and what a fresh :class:`AuditTrail`
+        accepts as its ``checkpoint`` argument to continue the chain.
+        """
+        records = self._read_records()
+        if not records:
+            return None
+        last = records[-1]
+        return {
+            "last_seq": last["seq"],
+            "entry_hash": last["entry_hash"],
+            "records": len(records),
+            "genesis_prev_hash": (
+                self._checkpoint["entry_hash"]
+                if self._checkpoint
+                else hashing.GENESIS_PREV_HASH
+            ),
+            "checkpointed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def rotate(
+        self,
+        max_records: int = 10000,
+        archive_dir: str | None = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Archive the current log and start a fresh file that continues the chain.
+
+        The live file is renamed to
+        ``<name>.<UTC timestamp>.archived.jsonl`` (in ``archive_dir``, which
+        defaults to the log's directory) and the checkpoint is written to
+        ``<log path>.checkpoint.json``. The next :class:`AuditTrail` opened
+        on this path with that checkpoint chains to the archived tip, so no
+        link is lost across the rotation. Returns the checkpoint dict.
+
+        Raises :class:`ValueError` when the log holds fewer than
+        ``max_records`` records (pass ``force=True`` to rotate anyway) or
+        when the log is empty.
+        """
+        records = self._read_records()
+        if not records:
+            raise ValueError("cannot rotate an empty log")
+        if not force and len(records) < max_records:
+            raise ValueError(
+                f"log has {len(records)} record(s), below max_records={max_records}; "
+                "pass force=True to rotate anyway"
+            )
+        cp = self.checkpoint()
+        assert cp is not None  # guarded by the empty-log check above
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        directory = archive_dir or os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(directory, exist_ok=True)
+        archive_path = os.path.join(
+            directory, f"{os.path.basename(self.path)}.{stamp}.archived.jsonl"
+        )
+        os.replace(self.path, archive_path)
+        cp["archived_log"] = archive_path
+        with open(self.checkpoint_path, "w", encoding="utf-8") as fh:
+            json.dump(cp, fh, indent=2)
+        return cp
+
+    @classmethod
+    def load_checkpoint(cls, path: str) -> Dict[str, Any]:
+        """Read the checkpoint file written by :meth:`rotate` for ``path``."""
+        with open(path + ".checkpoint.json", encoding="utf-8") as fh:
+            return json.load(fh)
 
     # ------------------------------------------------------------------
     # export
